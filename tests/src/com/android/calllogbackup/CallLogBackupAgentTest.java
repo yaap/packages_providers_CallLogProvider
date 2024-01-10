@@ -18,18 +18,18 @@ package com.android.calllogbackup;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-import static org.mockito.Mockito.eq;
 
 import android.app.backup.BackupDataOutput;
 import android.content.Context;
 import android.database.Cursor;
 import android.provider.CallLog;
 import android.test.AndroidTestCase;
-import android.test.suitebuilder.annotation.SmallTest;
 
 import androidx.test.InstrumentationRegistry;
+import androidx.test.filters.SmallTest;
 
 import com.android.calllogbackup.CallLogBackupAgent.Call;
 import com.android.calllogbackup.CallLogBackupAgent.CallLogBackupState;
