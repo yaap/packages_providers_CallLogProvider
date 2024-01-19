@@ -260,7 +260,16 @@ public class CallLogBackupAgent extends BackupAgent {
         }
     }
 
-    /** ${inheritDoc} */
+    /**
+     * Restores a call log backup given provided backup data.
+     * @param data the call log backup data; must be in a format written by
+     * {@link #onBackup(ParcelFileDescriptor, BackupDataOutput, ParcelFileDescriptor)}.
+     *
+     * @param appVersionCode The OS version of the data to restore; not used here.
+     * @param newState See parent class; not used here.
+     * @throws IOException Not thrown by the call log backup agent, but required by the underlying
+     * interface -- throwing IOException will cause the existing call log data to be cleared.
+     */
     @Override
     public void onRestore(BackupDataInput data, int appVersionCode, ParcelFileDescriptor newState)
             throws IOException {
@@ -424,6 +433,22 @@ public class CallLogBackupAgent extends BackupAgent {
             call.id = callId;
 
             int version = dataInput.readInt();
+
+            // Don't allow downgrades when restoring except when the version is 1010; that version
+            // adds some rather inconsequential columns to the call log database and it is generally
+            // preferable to allow the restore knowing that those new columns will be skipped in the
+            // restore.
+            if (version > VERSION && version != 1010) {
+                // If somehow we got a backed up row that is newer than the supported file format
+                // we know of, we will log an error and return null to represent an invalid item.
+                String errorMessage = "Backup version " + version + " is newer than the current "
+                        + "supported version, " + VERSION;
+                Log.w(TAG, errorMessage);
+                mBackupRestoreEventLoggerProxy.logItemsRestoreFailed(CALLLOGS, 1,
+                        errorMessage);
+                return null;
+            }
+
             if (version >= 1) {
                 call.date = dataInput.readLong();
                 call.duration = dataInput.readLong();
