@@ -260,13 +260,43 @@ public class CallLogBackupAgent extends BackupAgent {
         }
     }
 
-    /** ${inheritDoc} */
+    /**
+     * Restores a call log backup given provided backup data.
+     * @param data the call log backup data; must be in a format written by
+     * {@link #onBackup(ParcelFileDescriptor, BackupDataOutput, ParcelFileDescriptor)}.
+     *
+     * @param appVersionCode The version code of the data to restore; this MUST be less than or
+     *                       equal to {@link #VERSION} for a restore to work properly.
+     * @param newState See parent class; not used here.
+     * @throws IOException Not thrown by the call log backup agent, but required by the underlying
+     * interface -- throwing IOException will cause the existing call log data to be cleared.
+     */
     @Override
     public void onRestore(BackupDataInput data, int appVersionCode, ParcelFileDescriptor newState)
             throws IOException {
 
         if (isDebug()) {
             Log.d(TAG, "Performing Restore");
+        }
+
+        if (appVersionCode > VERSION) {
+            String errorMessage = "Backup version " + appVersionCode + " is newer than the current "
+                    + "supported version, " + VERSION;
+            Log.w(TAG, errorMessage);
+            // BackupDataInput only exposes the number of bytes in the backup, so we have to
+            // iterate through the data headers to get a count.
+            int rowsNotRestored = 0;
+            while(data.readNextHeader()) {
+                rowsNotRestored++;
+            }
+            mBackupRestoreEventLoggerProxy.logItemsRestoreFailed(CALLLOGS, rowsNotRestored,
+                    errorMessage);
+            // NOTE: We explicitly return here instead of throwing IOException.  The API docs state
+            // that the backup manager will treat an IOException as if the provider is now in a bad
+            // state and will clear its contents.  If the user tries to restore from a newer format
+            // than is supported, we can safely exit out here and leave whatever was in their call
+            // log intact.  In practice this is likely an empty call log on a new device.
+            return;
         }
 
         while (data.readNextHeader()) {

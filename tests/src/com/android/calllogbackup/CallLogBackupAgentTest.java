@@ -22,6 +22,7 @@ import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import android.app.backup.BackupDataInput;
 import android.app.backup.BackupDataOutput;
 import android.content.Context;
 import android.database.Cursor;
@@ -39,6 +40,8 @@ import org.mockito.Matchers;
 import org.mockito.Mock;
 import org.mockito.Mockito;
 import org.mockito.MockitoAnnotations;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -140,6 +143,33 @@ public class CallLogBackupAgentTest extends AndroidTestCase {
         assertEquals(1, state.version);
         assertEquals(1, state.callIds.size());
         assertTrue(state.callIds.contains(101));
+    }
+
+    /**
+     * Verifies that attempting to restore from a version newer than what the backup agent defines
+     * will result in no restored rows.
+     */
+    public void testRestoreFromHigherVersion() throws Exception {
+        BackupDataInput backupDataInput = Mockito.mock(BackupDataInput.class);
+
+        // Well, this is awkward.  BackupDataInput has no way to get the number of data elements
+        // it contains.  So we'll mock out "readNextHeader" to emulate there being some non-zero
+        // number of items to restore.
+        final int[] executionLimit = {10};
+        when(backupDataInput.readNextHeader()).thenAnswer(
+                new Answer<Object>() {
+                    @Override
+                    public Object answer(InvocationOnMock invocation) throws Throwable {
+                        executionLimit[0]--;
+                        return executionLimit[0] > 0;
+                    }
+                }
+        );
+
+        mCallLogBackupAgent.onRestore(backupDataInput, Integer.MAX_VALUE, null);
+
+        assertEquals(9, backupRestoreLoggerFailCount);
+        assertEquals(0, backupRestoreLoggerSuccessCount);
     }
 
     public void testReadState_MultipleCalls() throws Exception {
