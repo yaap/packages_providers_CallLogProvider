@@ -86,6 +86,8 @@ public class CallLogBackupAgent extends BackupAgent {
         String callScreeningComponentName = null;
         long missedReason = MISSED_REASON_NOT_MISSED;
         int isPhoneAccountMigrationPending;
+        int isBusinessCall;
+        String assertedDisplayName = "";
 
         @Override
         public String toString() {
@@ -128,7 +130,7 @@ public class CallLogBackupAgent extends BackupAgent {
 
     /** Current version of CallLogBackup. Used to track the backup format. */
     @VisibleForTesting
-    static final int VERSION = 1009;
+    static final int VERSION = 1010;
     /** Version indicating that there exists no previous backup entry. */
     @VisibleForTesting
     static final int VERSION_NO_PREVIOUS_STATE = 0;
@@ -166,7 +168,9 @@ public class CallLogBackupAgent extends BackupAgent {
         CallLog.Calls.CALL_SCREENING_APP_NAME,
         CallLog.Calls.CALL_SCREENING_COMPONENT_NAME,
         CallLog.Calls.MISSED_REASON,
-        CallLog.Calls.IS_PHONE_ACCOUNT_MIGRATION_PENDING
+        CallLog.Calls.IS_PHONE_ACCOUNT_MIGRATION_PENDING,
+        CallLog.Calls.IS_BUSINESS_CALL,
+        CallLog.Calls.ASSERTED_DISPLAY_NAME
     };
 
     /**
@@ -363,14 +367,31 @@ public class CallLogBackupAgent extends BackupAgent {
         boolean addForAllUsers = call.addForAllUsers == 1;
 
         // We backup the calllog in the user running this backup agent, so write calls to this user.
-        Calls.addCall(null /* CallerInfo */, this, call.number, call.postDialDigits, call.viaNumber,
-            call.numberPresentation, call.type, call.features, handle, call.date,
-            (int) call.duration, dataUsage, addForAllUsers, null, true /* isRead */,
-            call.callBlockReason /*callBlockReason*/,
-            call.callScreeningAppName /*callScreeningAppName*/,
-            call.callScreeningComponentName /*callScreeningComponentName*/,
-            call.missedReason,
-            call.isPhoneAccountMigrationPending);
+        CallLog.AddCallParams.AddCallParametersBuilder builder =
+                new CallLog.AddCallParams.AddCallParametersBuilder();
+        builder.setCallerInfo(null);
+        builder.setNumber(call.number);
+        builder.setPostDialDigits(call.postDialDigits);
+        builder.setViaNumber(call.viaNumber);
+        builder.setPresentation(call.numberPresentation);
+        builder.setCallType(call.type);
+        builder.setFeatures(call.features);
+        builder.setAccountHandle(handle);
+        builder.setStart(call.date);
+        builder.setDuration((int) call.duration);
+        builder.setDataUsage(dataUsage == null ? Long.MIN_VALUE : dataUsage);
+        builder.setAddForAllUsers(addForAllUsers);
+        builder.setUserToBeInsertedTo(null);
+        builder.setIsRead(true);
+        builder.setCallBlockReason(call.callBlockReason);
+        builder.setCallScreeningAppName(call.callScreeningAppName);
+        builder.setCallScreeningComponentName(call.callScreeningComponentName);
+        builder.setMissedReason(call.missedReason);
+        builder.setIsPhoneAccountMigrationPending(call.isPhoneAccountMigrationPending);
+        builder.setIsBusinessCall(call.isBusinessCall == 1);
+        builder.setBusinessName(call.assertedDisplayName);
+
+        Calls.addCall(this, builder.build());
     }
 
     @VisibleForTesting
@@ -512,6 +533,10 @@ public class CallLogBackupAgent extends BackupAgent {
             if (version >= 1009) {
                 call.isPhoneAccountMigrationPending = dataInput.readInt();
             }
+            if (version >= 1010) {
+                call.isBusinessCall = dataInput.readInt();
+                call.assertedDisplayName = readString(dataInput);
+            }
             /**
              * In >=T Android, Telephony PhoneAccountHandle must use SubId as the ID (the unique
              * identifier). Any version of Telephony call logs that are restored in >=T Android
@@ -588,6 +613,9 @@ public class CallLogBackupAgent extends BackupAgent {
             .getInt(cursor.getColumnIndex(CallLog.Calls.MISSED_REASON));
         call.isPhoneAccountMigrationPending = cursor.getInt(
                 cursor.getColumnIndex(CallLog.Calls.IS_PHONE_ACCOUNT_MIGRATION_PENDING));
+        call.isBusinessCall = cursor.getInt(cursor.getColumnIndex(CallLog.Calls.IS_BUSINESS_CALL));
+        call.assertedDisplayName =
+                cursor.getString(cursor.getColumnIndex(CallLog.Calls.ASSERTED_DISPLAY_NAME));
         /*
          * Starting Android T, the ID of Telephony PhoneAccountHandle need to migrate from IccId
          * to SubId. Because the mapping between IccId and SubId in different devices is different,
@@ -661,6 +689,9 @@ public class CallLogBackupAgent extends BackupAgent {
 
             data.writeLong(call.missedReason);
             data.writeInt(call.isPhoneAccountMigrationPending);
+
+            data.writeInt(call.isBusinessCall);
+            writeString(data, call.assertedDisplayName);
 
             data.flush();
 
