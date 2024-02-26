@@ -389,7 +389,7 @@ public class CallLogBackupAgent extends BackupAgent {
         builder.setMissedReason(call.missedReason);
         builder.setIsPhoneAccountMigrationPending(call.isPhoneAccountMigrationPending);
         builder.setIsBusinessCall(call.isBusinessCall == 1);
-        builder.setBusinessName(call.assertedDisplayName);
+        builder.setAssertedDisplayName(call.assertedDisplayName);
 
         Calls.addCall(this, builder.build());
     }
