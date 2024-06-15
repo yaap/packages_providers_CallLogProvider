@@ -9,6 +9,7 @@
     <application android:label="@string/app_label"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="true"
+        android:restoreAnyVersion="true"
         android:backupAgent="CallLogBackupAgent"
         android:forceQueryable="true"
         android:usesCleartextTraffic="false">
