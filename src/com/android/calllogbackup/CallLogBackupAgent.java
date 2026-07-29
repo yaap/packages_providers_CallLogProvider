@@ -17,7 +17,6 @@
 package com.android.calllogbackup;
 
 import static android.provider.CallLog.Calls.MISSED_REASON_NOT_MISSED;
-import static com.android.calllogbackup.Flags.callLogRestoreDeduplicationEnabled;
 import static com.android.calllogbackup.Flags.batchDeduplicationEnabled;
 
 import android.app.backup.BackupAgent;
@@ -35,10 +34,8 @@ import android.telecom.PhoneAccountHandle;
 import android.telephony.SubscriptionInfo;
 import android.telephony.SubscriptionManager;
 import android.util.Log;
-
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.telecom.util.CallLogUtils;
-
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -51,10 +48,14 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.SortedSet;
 import java.util.TreeSet;
 
@@ -118,12 +119,23 @@ public class CallLogBackupAgent extends BackupAgent {
 
     private static final String TAG = "CallLogBackupAgent";
 
+    private static final int MAX_CALL_LOGS = 3000;
+
     private static final int CALL_LOG_DEDUPLICATION_BATCH_SIZE = 250;
 
     /** Data types and errors used when reporting B&R success rate and errors.  */
     @BackupRestoreEventLogger.BackupRestoreDataType
     @VisibleForTesting
     static final String CALLLOGS = "telecom_call_logs";
+
+  /**
+   * This metric represents the total number of call logs identified for backup or restore before
+   * any capping or filtering is applied. It is crucial for understanding the full scope of the
+   * operation, especially if the process is interrupted(e.g. timeout), as it provides a baseline
+   * against which actual backed up/restored counts can be compared to detect partial operations.
+   */
+  @BackupRestoreEventLogger.BackupRestoreDataType @VisibleForTesting
+  static final String CALLLOGS_TOTAL = "telecom_call_logs_total";
 
     @BackupRestoreEventLogger.BackupRestoreError
     static final String ERROR_UNEXPECTED_KEY = "unexpected_key";
@@ -133,6 +145,8 @@ public class CallLogBackupAgent extends BackupAgent {
     static final String ERROR_READING_CALL_DATA = "error_reading_call_data";
     @BackupRestoreEventLogger.BackupRestoreError
     static final String ERROR_BACKUP_CALL_FAILED = "backup_call_failed";
+    @BackupRestoreEventLogger.BackupRestoreError
+    static final String ERROR_BACKUP_CAP_AT_LIMIT = "skipped_due_to_cap_at_limit";
 
     private BackupRestoreEventLogger mLogger;
 
@@ -142,6 +156,13 @@ public class CallLogBackupAgent extends BackupAgent {
     /** Version indicating that there exists no previous backup entry. */
     @VisibleForTesting
     static final int VERSION_NO_PREVIOUS_STATE = 0;
+
+    /**
+     * Backup versions that do not significantly change the structure of the call log database and
+     * it is generally preferable to allow the restore knowing that those new columns will be
+     * skipped in the restore.
+     */
+    static final List<Integer> ACCEPTABLE_DOWNGRADE_VERSIONS = Arrays.asList(1010, 1011, 1012);
 
     static final String NO_OEM_NAMESPACE = "no-oem-namespace";
 
@@ -158,6 +179,9 @@ public class CallLogBackupAgent extends BackupAgent {
 
     @VisibleForTesting
     protected Map<Integer, String> mSubscriptionInfoMap;
+
+    private int mRestoredCount;
+    private int mBackedUpCount;
 
     private static final String[] CALL_LOG_PROJECTION = new String[] {
         CallLog.Calls._ID,
@@ -294,22 +318,22 @@ public class CallLogBackupAgent extends BackupAgent {
         if (isDebug()) {
             Log.d(TAG, "Performing Restore");
         }
+        mRestoredCount = 0;
 
-        if (callLogRestoreDeduplicationEnabled() && batchDeduplicationEnabled()) {
+        List<Call> callsToRestore = getCallsToRestoreFromBackupData(data);
+
+        if (batchDeduplicationEnabled()) {
             if (hasExistingCallLogs()) {
                 Map<String, Call> callMap = new HashMap<>();
 
-                while (data.readNextHeader()) {
-                    Call call = readCallFromData(data);
-                    if (call != null && call.type != Calls.VOICEMAIL_TYPE) {
-                        String key = getCallKey(call.date, call.number);
-                        callMap.put(key, call);
+                for (Call call : callsToRestore) {
+                    String key = getCallKey(call.date, call.number);
+                    callMap.put(key, call);
 
-                        if (callMap.size() >= getBatchSize()) {
-                            restoreCallBatch(callMap);
-                            // Clear the map for the next batch
-                            callMap.clear();
-                        }
+                    if (callMap.size() >= getBatchSize()) {
+                        restoreCallBatch(callMap);
+                        // Clear the map for the next batch
+                        callMap.clear();
                     }
                 }
 
@@ -318,23 +342,54 @@ public class CallLogBackupAgent extends BackupAgent {
                 }
             } else {
                 // No existing call logs, so no need for deduplication
-                performRestoreWithoutDeduplication(data);
+                performRestoreWithoutDeduplication(callsToRestore);
             }
-            return;
-        }
-
-        while (data.readNextHeader()) {
-            Call call = readCallFromData(data);
-            if (call != null && call.type != Calls.VOICEMAIL_TYPE) {
-                if (!callLogRestoreDeduplicationEnabled() || !isDuplicateCall(call)) {
-                    writeCallToProvider(call);
-                    mBackupRestoreEventLoggerProxy.logItemsRestored(CALLLOGS, /* count */ 1);
+        } else {
+            for (Call call : callsToRestore) {
+                if (!isDuplicateCall(call)) {
+                    writeAndLogCall(call);
                     if (isDebug()) {
                         Log.d(TAG, "Restored call: " + call);
                     }
                 }
             }
         }
+
+        Log.i(TAG, "Actual restored call logs count: " + mRestoredCount);
+    }
+
+    private List<Call> getCallsToRestoreFromBackupData(BackupDataInput data) throws IOException {
+        Log.i(TAG, "Performing Restore with Top-K limit");
+
+        int totalCallLogs = 0;
+        // Create a min-heap. The head of the queue will always be the call with the
+        // smallest (oldest) date.
+        PriorityQueue<Call> pq = new PriorityQueue<>(MAX_CALL_LOGS,
+                Comparator.comparingLong(call -> call.date));
+
+        while (data.readNextHeader()) {
+            Call call = readCallFromData(data);
+            if (call != null && call.type != Calls.VOICEMAIL_TYPE) {
+                totalCallLogs++;
+                pq.add(call);
+                if (pq.size() > MAX_CALL_LOGS) {
+                    pq.poll();
+                }
+            }
+        }
+        Log.i(TAG, "Call logs to be restored before capping: " + totalCallLogs);
+        mBackupRestoreEventLoggerProxy.logItemsRestored(
+                CALLLOGS_TOTAL, totalCallLogs);
+
+        List<Call> callsToRestore = new ArrayList<>(pq.size());
+        while (!pq.isEmpty()) {
+            callsToRestore.add(pq.poll());
+        }
+        Collections.sort(callsToRestore, (c1, c2) -> Long.compare(c2.date, c1.date));
+        Log.i(TAG, "Call logs to be restored (after capping): " + callsToRestore.size());
+        mBackupRestoreEventLoggerProxy.logItemsRestoreFailed(
+            CALLLOGS, totalCallLogs - callsToRestore.size(), ERROR_BACKUP_CAP_AT_LIMIT);
+        return callsToRestore;
     }
 
     private void restoreCallBatch(Map<String, Call> callMap) {
@@ -400,18 +455,16 @@ public class CallLogBackupAgent extends BackupAgent {
         }
     }
 
-    private void performRestoreWithoutDeduplication(BackupDataInput data) throws IOException {
-        while (data.readNextHeader()) {
-            Call call = readCallFromData(data);
-            if (call != null && call.type != Calls.VOICEMAIL_TYPE) {
-                writeAndLogCall(call);
-            }
+    private void performRestoreWithoutDeduplication(List<Call> calls) {
+        for (Call call : calls) {
+            writeAndLogCall(call);
         }
     }
 
     private void writeAndLogCall(Call call) {
         writeCallToProvider(call);
         mBackupRestoreEventLoggerProxy.logItemsRestored(CALLLOGS, /* count */ 1);
+        mRestoredCount++;
         if (isDebug()) {
             Log.d(TAG, "Restored call: " + call);
         }
@@ -437,6 +490,7 @@ public class CallLogBackupAgent extends BackupAgent {
     @VisibleForTesting
     void runBackup(CallLogBackupState state, BackupDataOutput data, Iterable<Call> calls) {
         SortedSet<Integer> callsToRemove = new TreeSet<>(state.callIds);
+        mBackedUpCount = 0;
 
         // Loop through all the call log entries to identify:
         // (1) new calls
@@ -448,16 +502,18 @@ public class CallLogBackupAgent extends BackupAgent {
                     Log.d(TAG, "Adding call to backup: " + call);
                 }
 
-                // This call new (not in our list from the last backup), lets back it up.
+                // This call is new (not in our list from the last backup), lets back it up.
                 addCallToBackup(data, call);
                 state.callIds.add(call.id);
             } else {
                 // This call still exists in the current call log so delete it from the
                 // "callsToRemove" set since we want to keep it.
                 callsToRemove.remove(call.id);
-                mBackupRestoreEventLoggerProxy.logItemsBackedUp(CALLLOGS, /* count */ 1);
+                logAndCountBackedUpItem();
             }
         }
+
+        Log.i(TAG, "Actual backed up call logs count: " + mBackedUpCount);
 
         // Remove calls which no longer exist in the set.
         for (Integer i : callsToRemove) {
@@ -478,21 +534,35 @@ public class CallLogBackupAgent extends BackupAgent {
         // CallLogProvider has special locks in place for sychronizing when to read.  Using the APIs
         // gives us that for free.
         ContentResolver resolver = getContentResolver();
-        Cursor cursor = resolver.query(
-                CallLog.Calls.CONTENT_URI, CALL_LOG_PROJECTION, null, null, null);
-        if (cursor != null) {
-            try {
-                while (cursor.moveToNext()) {
-                    Call call = readCallFromCursor(cursor);
-                    if (call != null && call.type != Calls.VOICEMAIL_TYPE) {
-                        calls.add(call);
-                    }
+        int totalCallLogs = 0;
+        try (Cursor cursor = resolver.query(
+                CallLog.Calls.CONTENT_URI,
+                CALL_LOG_PROJECTION,
+                Calls.TYPE + " != " + Calls.VOICEMAIL_TYPE,
+                null,
+                /* sortOrder */ Calls.DATE + " DESC")) {
+
+            if (cursor == null) {
+                return calls;
+            }
+
+            totalCallLogs = cursor.getCount();
+            Log.i(TAG, "Call logs to be backed up before capping: " + totalCallLogs);
+            mBackupRestoreEventLoggerProxy.logItemsBackedUp(CALLLOGS_TOTAL, totalCallLogs);
+
+            while (cursor.moveToNext() && calls.size() < MAX_CALL_LOGS) {
+                Call call = readCallFromCursor(cursor);
+                // The previous resolver.query filters out voicemails, so we only need to check
+                // for null.
+                if (call != null) {
+                    calls.add(call);
                 }
-            } finally {
-                cursor.close();
             }
         }
 
+        Log.i(TAG, "Call logs to be backed up after capping: " + calls.size());
+        mBackupRestoreEventLoggerProxy.logItemsBackupFailed(CALLLOGS, totalCallLogs - calls.size(),
+            ERROR_BACKUP_CAP_AT_LIMIT);
         return calls;
     }
 
@@ -598,11 +668,9 @@ public class CallLogBackupAgent extends BackupAgent {
 
             int version = dataInput.readInt();
 
-            // Don't allow downgrades when restoring except when the version is 1010; that version
-            // adds some rather inconsequential columns to the call log database and it is generally
-            // preferable to allow the restore knowing that those new columns will be skipped in the
-            // restore.
-            if (version > VERSION && version != 1010) {
+            // Don't allow downgrades when restoring except when the version is one that is
+            // specifically marked as safe to restore from.
+            if (version > VERSION && !ACCEPTABLE_DOWNGRADE_VERSIONS.contains(version)) {
                 // If somehow we got a backed up row that is newer than the supported file format
                 // we know of, we will log an error and return null to represent an invalid item.
                 String errorMessage = "Backup version " + version + " is newer than the current "
@@ -611,6 +679,15 @@ public class CallLogBackupAgent extends BackupAgent {
                 mBackupRestoreEventLoggerProxy.logItemsRestoreFailed(CALLLOGS, 1,
                         errorMessage);
                 return null;
+            }
+
+            if (isDebug()) {
+                Log.d(
+                        TAG,
+                        "Restoring from backup version "
+                                + version
+                                + ", current version: "
+                                + VERSION);
             }
 
             if (version >= 1) {
@@ -854,7 +931,7 @@ public class CallLogBackupAgent extends BackupAgent {
             output.writeEntityHeader(Integer.toString(call.id), baos.size());
             output.writeEntityData(baos.toByteArray(), baos.size());
 
-            mBackupRestoreEventLoggerProxy.logItemsBackedUp(CALLLOGS, /* count */ 1);
+            logAndCountBackedUpItem();
 
             if (isDebug()) {
                 Log.d(TAG, "Wrote call to backup: " + call + " with byte array: " + baos);
@@ -932,6 +1009,10 @@ public class CallLogBackupAgent extends BackupAgent {
         */
     }
 
+    private void logAndCountBackedUpItem() {
+        mBackupRestoreEventLoggerProxy.logItemsBackedUp(CALLLOGS, 1);
+        mBackedUpCount++;
+    }
 
     private void writeString(DataOutputStream data, String str) throws IOException {
         if (str == null) {
